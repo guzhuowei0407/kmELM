@@ -30,6 +30,7 @@ module decompInitMod
   ! !PUBLIC MEMBER FUNCTIONS:
   public decompInit_lnd          ! initializes lnd grid decomposition into clumps and processors
   public user_defined_decomposition    ! Implementation of user defined decomposition
+  public bubble_sort
   public decompInit_clumps       ! initializes atm grid decomposition into clumps
   public decompInit_gtlcp         ! initializes g,l,c,p decomp info
   public decompInit_lnd_using_gp ! initialize lnd grid decomposition into clumps and processors using graph partitioning approach
@@ -365,16 +366,21 @@ contains
     integer :: ag,an,ai,aj            ! indices
     integer :: numg                   ! number of land gridcells
     logical :: seglen1                ! is segment length one
-    real(r8):: seglen                 ! average segment length
+    !real(r8):: seglen                 ! average segment length
     real(r8):: rcid                   ! real value of cid
     integer :: cid,pid                ! indices
-    integer :: n,m,ng                 ! indices
+    integer :: n,m,ng,i                 ! indices
     integer :: ier                    ! error code
     integer :: beg,end,lsize,gsize    ! used for gsmap init
     integer, pointer :: gindex(:)     ! global index for gsmap init
     integer, pointer :: clumpcnt(:)   ! clump index counter
     integer, allocatable :: proc_ncell(:) ! number of cells assigned to a process
     integer, allocatable :: proc_begg(:)  ! beginning cell index assigned to a process
+
+    character(len=20) :: case_name    ! 1D_partition or user_defined
+    integer, allocatable :: unique_values(:)  ! the max number of unique values is nclumps
+    integer :: num_unique, val
+    logical :: only_zero_and_one
     !------------------------------------------------------------------------------
 
     lns = lni * lnj
@@ -466,13 +472,13 @@ contains
     enddo
 
     ! count total land gridcells
-    !numg = 0
-    !do ln = 1,lns
-    !   if (amask(ln) == 1) then
-    !      numg = numg + 1
-    !   endif
-    !enddo
-    numg = lns
+    numg = 0
+    do ln = 1,lns
+       if (amask(ln) > 0) then
+          numg = numg + 1
+       endif
+    enddo
+    !numg = lns
    
     if (npes > numg) then
        write(iulog,*) 'decompInit_lnd(): Number of processes exceeds number ', &
@@ -485,19 +491,19 @@ contains
        call endrun(msg=errMsg(__FILE__, __LINE__))
     end if
 
-    if (float(numg)/float(nclumps) < float(nsegspc)) then
-       seglen1 = .true.
-       seglen = 1.0_r8
-    else
-       seglen1 = .false.
-       seglen = dble(numg)/(dble(nsegspc)*dble(nclumps))
-    endif
+    !if (float(numg)/float(nclumps) < float(nsegspc)) then
+    !   seglen1 = .true.
+    !   seglen = 1.0_r8
+    !else
+    !   seglen1 = .false.
+    !   seglen = dble(numg)/(dble(nsegspc)*dble(nclumps))
+    !endif
 
-    if (masterproc) then
-       write(iulog,*) ' decomp precompute numg,nclumps,seglen1,avg_seglen,nsegspc=', &
-            numg,nclumps,seglen1,&
-            sngl(seglen),sngl(dble(numg)/(seglen*dble(nclumps)))
-    end if
+    !if (masterproc) then
+    !   write(iulog,*) ' decomp precompute numg,nclumps,seglen1,avg_seglen,nsegspc=', &
+    !        numg,nclumps,seglen1,&
+    !        sngl(seglen),sngl(dble(numg)/(seglen*dble(nclumps)))
+    !end if
 
     ! Assign gridcells to clumps (and thus pes) ---
 
@@ -507,27 +513,94 @@ contains
        call endrun(msg=errMsg(__FILE__, __LINE__))
     end if
 
+    case_name = "1D_partition" 
+    num_unique = 0
+    only_zero_and_one = .true.
+
+    allocate(unique_values(nclumps))
+
+    do n = 1, lns
+       val = amask(ln)
+
+       ! the value in amask only contain 0 and 1
+       if (val /= 0 .and. val /= 1) then
+          only_zero_and_one = .false.
+       end if
+
+       ! store unique values, except 0
+       if (val /= 0) then
+          if (.not. any(unique_values(1:num_unique) == val)) then
+             num_unique = num_unique + 1
+             if (num_unique > nclumps) then
+                ! the amount of unique values greater than nclumps
+                write(iulog,*) 'user_defined_decomposition(): Unique values exceed ', &
+                               'allowed clumps limit: ', num_unique, nclumps
+                call endrun(msg=errMsg(__FILE__, __LINE__))
+             end if
+             unique_values(num_unique) = val
+          end if
+       end if
+    end do
+
+    call bubble_sort(unique_values, num_unique)
+
+    if (.not. all(unique_values(1:num_unique) == [(i, i = 1, num_unique)])) then
+       case_name = "1D_partition"
+    else if (.not. only_zero_and_one .and. num_unique == nclumps) then
+       case_name = "user_defined"
+    end if
+
+    deallocate(unique_values)
+
     lcid(:) = 0
     ng = 0
-    do ln = 1,lns
-       if (amask(ln) > 0) then
-          ng = ng  + 1
 
-          cid = amask(ln)
-          lcid(ln) = cid
-        
-          !--- give gridcell cell to pe that owns cid ---
-          !--- this needs to be done to subsequently use function
-          !--- get_proc_bounds(begg,endg) 
-          if (iam == clumps(cid)%owner) then
-             procinfo%ncells  = procinfo%ncells  + 1
-          endif
+    if (case_name == "user_defined") then
+       ! partition strategy
+       do ln = 1, lns
+          if (amask(ln) > 0) then
+             ng = ng + 1
+            
+             ! amask is the mask value in domain file
+             ! point out which grid cell will be assign to which clump
+             cid = amask(ln)
+             lcid(ln) = cid
 
-          !--- give gridcell to cid ---
-          clumps(cid)%ncells  = clumps(cid)%ncells  + 1
+             !--- give gridcell cell to pe that owns cid ---
+             !--- this needs to be done to subsequently use function
+             !--- get_proc_bounds(begg,endg) 
+             if (iam == clumps(cid)%owner) then
+                procinfo%ncells = procinfo%ncells + 1
+             end if
 
-       end if
-    enddo
+             !--- give gridcell to cid ---
+             clumps(cid)%ncells = clumps(cid)%ncells + 1
+          end if
+       end do
+
+    else
+       ! 1D_partition
+       do ln = 1, lns
+           if (amask(ln) > 0) then
+              ng = ng + 1 
+
+              !--- give to clumps in order
+              rcid = (dble(ng - 1) / dble(numg)) * dble(1) * dble(nclumps)
+              cid = mod(int(rcid), nclumps) + 1
+              lcid(ln) = cid
+
+              !--- give gridcell cell to pe that owns cid ---
+              !--- this needs to be done to subsequently use function
+              !--- get_proc_bounds(begg,endg) 
+              if (iam == clumps(cid)%owner) then
+                 procinfo%ncells = procinfo%ncells + 1
+              end if
+
+              !--- give gridcell to cid ---
+              clumps(cid)%ncells = clumps(cid)%ncells + 1
+           end if
+       end do
+    end if
 
     ! calculate number of cells per process
     allocate(proc_ncell(0:npes-1), stat=ier)
@@ -638,6 +711,23 @@ contains
     call shr_sys_flush(iulog)
 
   end subroutine user_defined_decomposition
+
+  subroutine bubble_sort(arr, n)
+    implicit none
+    integer, intent(inout) :: arr(n)
+    integer, intent(in) :: n
+    integer :: i, j, temp
+
+    do i = 1, n - 1
+        do j = 1, n - i
+            if (arr(j) > arr(j + 1)) then
+                temp = arr(j)
+                arr(j) = arr(j + 1)
+                arr(j + 1) = temp
+            end if
+        end do
+    end do
+  end subroutine bubble_sort
 
   !------------------------------------------------------------------------------
   subroutine decompInit_lnd_simple(lni,lnj,amask)
