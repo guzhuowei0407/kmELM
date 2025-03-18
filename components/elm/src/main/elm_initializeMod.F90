@@ -91,7 +91,7 @@ contains
     !
     ! !LOCAL VARIABLES:
     integer           :: ier                     ! error status
-    integer           :: i,j,n,k,c,l,g,t,ti,topi           ! indices
+    integer           :: i,j,n,k,c,l,g,t,ti,topi,lns           ! indices
     integer           :: nl                      ! gdc and glo lnd indices
     integer           :: ns, ni, nj              ! global grid sizes
     integer           :: begg, endg              ! processor bounds
@@ -111,6 +111,7 @@ contains
     integer           :: nclumps                 ! number of clumps on this processor
     integer           :: nc                      ! clump index
     character(len=32) :: subname = 'initialize1' ! subroutine name
+    character(len=32) :: domain_type = 'round_robin' ! default domain decomp type
     !-----------------------------------------------------------------------
 
     call t_startf('elm_init1')
@@ -186,8 +187,17 @@ contains
     ! ------------------------------------------------------------------------
     ! Determine clm gridcell decomposition and processor bounds for gridcells
     ! ------------------------------------------------------------------------
+    lns = ni * nj
+    do i = 1, lns
+       if (amask(i) /= 0 .and. amask(i) /= 1) then
+          domain_type = 'user_defined_decomposition'
+          exit
+       endif
+    enddo
 
-    select case (trim(domain_decomp_type))
+    ! graph_partitioning and simple can be activate by domain_decomp_type
+    ! domain_decomp_type = [round_robin, user_defined_decomposition, graph_partitioning, simple]
+    select case (trim(domain_type))
     case ("round_robin")
        call decompInit_lnd(ni, nj, amask)
        deallocate(amask)
